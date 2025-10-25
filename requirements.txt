@@ -1,2 +1,1 @@
-python-telegram-bot[job-queue]==21.5
-aiofiles
+python-telegram-bot[job-queue]==21.6
