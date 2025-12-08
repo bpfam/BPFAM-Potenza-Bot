@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "POTENZA-FULL-FIX-ADMIN-DB"
+VERSION = "POTENZA-FULL-FIX-ADMIN-DB-BACKUP"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
@@ -49,7 +49,7 @@ INFO_PAGE_TEXT = os.environ.get(
 
 # ---------------- ADMIN (SAFE MODE) ----------------
 def build_admin_ids() -> set[int]:
-    ids = set()
+    ids: set[int] = set()
     single = os.environ.get("ADMIN_ID", "").replace(" ", "")
     if single.isdigit():
         ids.add(int(single))
@@ -61,12 +61,13 @@ def build_admin_ids() -> set[int]:
     return ids
 
 ADMIN_IDS = build_admin_ids()
+log.info("ADMIN_IDS: %s", ADMIN_IDS)
 
-def is_admin(uid):
-    # ✅ Se ADMIN_IDS è vuoto → tutti admin (NON ti resta più bloccato)
+def is_admin(uid: int | None) -> bool:
+    # Se ADMIN_IDS è vuoto → tutti possono usare i comandi admin
     if not ADMIN_IDS:
         return True
-    return uid in ADMIN_IDS
+    return bool(uid) and uid in ADMIN_IDS
 
 # ---------------- DB ----------------
 def init_db():
@@ -135,6 +136,22 @@ def parse_hhmm(h):
     except:
         return dtime(3, 0)
 
+def is_sqlite_db(path: str):
+    p = Path(path)
+    if not p.exists():
+        return False, "Il file non esiste"
+    try:
+        with open(p, "rb") as f:
+            header = f.read(16)
+        if header != b"SQLite format 3\x00":
+            return False, "Header SQLite mancante"
+        conn = sqlite3.connect(path)
+        conn.execute("SELECT 1")
+        conn.close()
+        return True, "OK"
+    except Exception as e:
+        return False, f"Errore lettura: {e}"
+
 # ---------------- KEYBOARD ----------------
 def kb_home():
     return InlineKeyboardMarkup([[ 
@@ -147,39 +164,94 @@ def kb_back():
         InlineKeyboardButton("⬅️ Indietro", callback_data="HOME")
     ]])
 
-# ---------------- HANDLER ----------------
-async def start(update, context):
+# ---------------- HANDLER PUBBLICI ----------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    upsert_user(u)
+    if u:
+        upsert_user(u)
     try:
-        await update.message.reply_photo(PHOTO_URL, caption=WELCOME_TEXT, reply_markup=kb_home())
-    except:
-        await update.message.reply_text(WELCOME_TEXT, reply_markup=kb_home())
+        await update.message.reply_photo(
+            PHOTO_URL,
+            caption=WELCOME_TEXT,
+            reply_markup=kb_home()
+        )
+    except Exception:
+        await update.message.reply_text(
+            WELCOME_TEXT,
+            reply_markup=kb_home()
+        )
 
-async def on_button(update, context):
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not q:
+        return
     await q.answer()
     if q.data == "MENU":
-        await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back())
+        await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back(), parse_mode="Markdown")
     elif q.data == "INFO":
-        await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back())
+        await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back(), parse_mode="Markdown")
     elif q.data == "HOME":
         await q.message.edit_text(WELCOME_TEXT, reply_markup=kb_home())
 
 # ---------------- ADMIN COMMANDS ----------------
-async def status_cmd(update, context):
-    if not is_admin(update.effective_user.id): return
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
     await update.message.reply_text(
-        f"✅ Online v{VERSION}\n👥 Utenti: {count_users()}"
+        f"✅ Online v{VERSION}\n👥 Utenti: {count_users()}\nDB: {DB_FILE}\nBackup dir: {BACKUP_DIR}"
     )
 
-async def utenti_cmd(update, context):
-    if not is_admin(update.effective_user.id): return
+async def utenti_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
     users = get_all_users()
     await update.message.reply_text(f"👥 Utenti totali: {len(users)}")
 
-async def id_cmd(update, context):
-    await update.message.reply_text(f"Il tuo ID è: {update.effective_user.id}")
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Il tuo ID è: <code>{update.effective_user.id}</code>", parse_mode="HTML")
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    ok, why = is_sqlite_db(DB_FILE)
+    if not ok:
+        await update.message.reply_text(f"⚠️ DB non valido: {why}")
+        return
+
+    try:
+        Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        db_out  = Path(BACKUP_DIR) / f"backup_{stamp}.db"
+        zip_out = Path(BACKUP_DIR) / f"backup_{stamp}.zip"
+
+        shutil.copy2(DB_FILE, db_out)
+
+        with zipfile.ZipFile(zip_out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.write(db_out, arcname=db_out.name)
+
+        # invio .db
+        try:
+            with open(db_out, "rb") as fh:
+                await update.message.reply_document(
+                    document=InputFile(fh, filename=db_out.name),
+                    caption=f"✅ Backup .db: {db_out.name}",
+                )
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Impossibile inviare il .db: {e}")
+
+        # invio .zip
+        try:
+            with open(zip_out, "rb") as fh:
+                await update.message.reply_document(
+                    document=InputFile(fh, filename=zip_out.name),
+                    caption=f"✅ Backup ZIP: {zip_out.name}",
+                )
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Impossibile inviare lo ZIP: {e}")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Errore backup: {e}")
 
 # ---------------- MAIN ----------------
 def main():
@@ -191,13 +263,17 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Pubblici
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("utenti", utenti_cmd))
-    app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    log.info("✅ BOT AVVIATO")
+    # Admin
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("utenti", utenti_cmd))
+    app.add_handler(CommandHandler("id",     id_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+
+    log.info("✅ BOT AVVIATO — %s", VERSION)
     app.run_polling()
 
 if __name__ == "__main__":
