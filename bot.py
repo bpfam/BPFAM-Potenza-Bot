@@ -1,5 +1,5 @@
 # =====================================================
-# BPFAM POTENZA BOT — FULL FIX ADMIN + DB + BACKUP
+# BPFAM POTENZA BOT — FULL FIX ADMIN + DB + BACKUP + RESTORE
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio, aiohttp, zipfile
@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "POTENZA-FULL-FIX-ADMIN-DB-BACKUP"
+VERSION = "POTENZA-FULL-FIX-ADMIN-DB-BACKUP-RESTORE"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
@@ -208,7 +208,10 @@ async def utenti_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"👥 Utenti totali: {len(users)}")
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Il tuo ID è: <code>{update.effective_user.id}</code>", parse_mode="HTML")
+    await update.message.reply_text(
+        f"Il tuo ID è: <code>{update.effective_user.id}</code>",
+        parse_mode="HTML"
+    )
 
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -253,6 +256,114 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Errore backup: {e}")
 
+# --- RESTORE_DB (MERGE SICURO, NON CANCELLA NESSUNO) ---
+async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    msg = update.effective_message
+    if not msg.reply_to_message or not msg.reply_to_message.document:
+        await update.message.reply_text(
+            "Per usare /restore_db:\n"
+            "1️⃣ Invia un file .db al bot\n"
+            "2️⃣ Tieni premuto sul file ➜ *Rispondi*\n"
+            "3️⃣ Scrivi /restore_db come risposta a QUEL file",
+            parse_mode="Markdown"
+        )
+        return
+
+    doc = msg.reply_to_message.document
+    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+    tmp = Path(BACKUP_DIR) / f"restore_{doc.file_unique_id}.db"
+
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(custom_path=str(tmp))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Errore download file: {e}")
+        return
+
+    ok, why = is_sqlite_db(str(tmp))
+    if not ok:
+        await update.message.reply_text(f"❌ Il file non è un DB SQLite valido: {why}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        main = sqlite3.connect(DB_FILE)
+        imp  = sqlite3.connect(tmp)
+
+        # garantisco la tabella nel main
+        main.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            first_seen TEXT,
+            last_seen TEXT
+        )""")
+        main.commit()
+
+        # leggo struttura del DB importato
+        cols_imp = {r[1] for r in imp.execute("PRAGMA table_info('users')").fetchall()}
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if {"first_seen", "last_seen"}.issubset(cols_imp):
+            rows = imp.execute(
+                "SELECT user_id,username,first_name,last_name,first_seen,last_seen FROM users"
+            ).fetchall()
+        else:
+            rows = [
+                (uid, un, fn, ln, now_iso, now_iso)
+                for (uid, un, fn, ln) in imp.execute(
+                    "SELECT user_id,username,first_name,last_name FROM users"
+                ).fetchall()
+            ]
+
+        before = main.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+        sql = """
+        INSERT INTO users (user_id, username, first_name, last_name, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username   = COALESCE(excluded.username, users.username),
+            first_name = COALESCE(excluded.first_name, users.first_name),
+            last_name  = COALESCE(excluded.last_name,  users.last_name),
+            first_seen = COALESCE(users.first_seen,   excluded.first_seen),
+            last_seen  = COALESCE(excluded.last_seen, users.last_seen)
+        """
+        main.executemany(sql, rows)
+        main.commit()
+
+        after = main.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+        await update.message.reply_text(
+            f"✅ Restore completato.\n"
+            f"Utenti prima: {before}\n"
+            f"Utenti dopo:  {after}\n"
+            f"Aggiunti/aggiornati: {after-before}"
+        )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Errore restore: {e}")
+    finally:
+        try:
+            imp.close()
+        except Exception:
+            pass
+        try:
+            main.close()
+        except Exception:
+            pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 # ---------------- MAIN ----------------
 def main():
     if not BOT_TOKEN:
@@ -272,6 +383,7 @@ def main():
     app.add_handler(CommandHandler("utenti", utenti_cmd))
     app.add_handler(CommandHandler("id",     id_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore_db", restore_db))
 
     log.info("✅ BOT AVVIATO — %s", VERSION)
     app.run_polling()
