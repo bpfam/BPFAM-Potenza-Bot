@@ -4,6 +4,7 @@
 # - Testi da ENV: WELCOME_TEXT, MENU_PAGE_TEXT, INFO_PAGE_TEXT
 # - Admin/DB/Backup/Restore/Broadcast come BPFARM v3.6.5-secure-full
 # - FIX DB: aggiunge automaticamente first_seen / last_seen se mancano
+# - Admin: legge sia ADMIN_ID che ADMIN_IDS
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio, aiohttp, zipfile
@@ -41,13 +42,6 @@ def _txt(key, default=""):
     return v
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-# Multi-admin: ADMIN_IDS = "123,456,789"
-ADMIN_IDS = {
-    int(x)
-    for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",")
-    if x.isdigit()
-}
 
 DB_FILE     = os.environ.get("DB_FILE", "./data/users.db")
 BACKUP_DIR  = os.environ.get("BACKUP_DIR", "./backup")
@@ -173,10 +167,32 @@ def get_all_users():
     conn.close()
     return out
 
-# ---------------- UTILS ----------------
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+# ---------------- ADMIN UTILS (ADMIN_ID + ADMIN_IDS) ----------------
+def build_admin_ids() -> set[int]:
+    ids: set[int] = set()
 
+    # ADMIN_ID singolo (vecchia versione)
+    single = os.environ.get("ADMIN_ID", "").replace(" ", "")
+    if single.isdigit():
+        ids.add(int(single))
+
+    # ADMIN_IDS lista
+    multi_raw = os.environ.get("ADMIN_IDS", "")
+    multi_raw = multi_raw.replace(" ", "").strip()
+    if multi_raw:
+        for part in multi_raw.split(","):
+            if part.isdigit():
+                ids.add(int(part))
+
+    return ids
+
+ADMIN_IDS = build_admin_ids()
+log.info("ADMIN_IDS caricati: %s", ADMIN_IDS)
+
+def is_admin(uid: int | None) -> bool:
+    return bool(uid) and uid in ADMIN_IDS
+
+# ---------------- UTILS VARI ----------------
 def parse_hhmm(h):
     try:
         h, m = map(int, h.split(":"))
@@ -317,8 +333,8 @@ async def flood_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_flood(context: ContextTypes.DEFAULT_TYPE):
     USER_MSG_COUNT.clear()
 
-# ---------------- ADMIN (come BPFARM 3.6.5) ----------------
-def admin_only(update: Update):
+# ---------------- ADMIN COMMANDS ----------------
+def admin_only(update: Update) -> bool:
     return update.effective_user and is_admin(update.effective_user.id)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -639,10 +655,22 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/utenti — totale e CSV degli utenti\n"
         "/broadcast <testo> — invia a tutti\n"
         "/broadcast (in reply) — copia contenuto a tutti\n"
-        "/broadcast_stop — interrompe l'invio"
+        "/broadcast_stop — interrompe l'invio\n"
+        "/id — mostra il tuo ID Telegram"
     )
     await update.message.reply_text(
         msg, parse_mode="HTML", protect_content=True
+    )
+
+# --- /id (anche non admin, ma utile per configurare)
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        f"Il tuo ID Telegram è: <code>{uid}</code>",
+        parse_mode="HTML",
+        protect_content=True,
     )
 
 # --- /broadcast
@@ -661,9 +689,9 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.application.bot_data["broadcast_stop"] = False
 
+    text_body = None
     if m.reply_to_message:
         mode = "copy"
-        text_body = None
         text_preview = (
             m.reply_to_message.text
             or m.reply_to_message.caption
@@ -812,6 +840,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("broadcast_stop", broadcast_stop_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
 
     # Jobs
     hhmm = parse_hhmm(BACKUP_TIME)
