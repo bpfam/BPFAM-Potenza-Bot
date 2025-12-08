@@ -1,5 +1,6 @@
 # =====================================================
-# BPFAM POTENZA BOT — FULL FIX ADMIN + DB + BACKUP + RESTORE
+# BPFAM POTENZA BOT — FULL: ADMIN + DB + BACKUP + RESTORE + BROADCAST
+# Clonabile per altri bot (basta cambiare le ENV)
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio, aiohttp, zipfile
@@ -13,7 +14,7 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "POTENZA-FULL-FIX-ADMIN-DB-BACKUP-RESTORE"
+VERSION = "POTENZA-FULL-1.0"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
@@ -193,7 +194,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data == "HOME":
         await q.message.edit_text(WELCOME_TEXT, reply_markup=kb_home())
 
-# ---------------- ADMIN COMMANDS ----------------
+# ---------------- ADMIN BASE ----------------
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -213,6 +214,7 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+# ---------------- BACKUP ----------------
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -256,7 +258,7 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Errore backup: {e}")
 
-# --- RESTORE_DB (MERGE SICURO, NON CANCELLA NESSUNO) ---
+# ---------------- RESTORE_DB (MERGE) ----------------
 async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -296,7 +298,6 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         main = sqlite3.connect(DB_FILE)
         imp  = sqlite3.connect(tmp)
 
-        # garantisco la tabella nel main
         main.execute("""
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
@@ -308,7 +309,6 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )""")
         main.commit()
 
-        # leggo struttura del DB importato
         cols_imp = {r[1] for r in imp.execute("PRAGMA table_info('users')").fetchall()}
         now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -364,6 +364,106 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+# ---------------- BROADCAST ----------------
+BCAST_SLEEP = 0.08
+BCAST_PROGRESS_EVERY = 200
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    m = update.effective_message
+    users = get_all_users()
+    total = len(users)
+    if total == 0:
+        await m.reply_text("Nessun utente nel DB.")
+        return
+
+    context.application.bot_data["broadcast_stop"] = False
+
+    # Modalità: reply (copia media) oppure testo
+    if m.reply_to_message:
+        mode = "copy"
+        text_preview = (
+            m.reply_to_message.text
+            or m.reply_to_message.caption
+            or "(media)"
+        )
+        text_body = None
+    else:
+        mode = "text"
+        text_body = " ".join(context.args) if context.args else None
+        if not text_body:
+            await m.reply_text(
+                "Uso: /broadcast <testo> oppure in reply a un contenuto /broadcast"
+            )
+            return
+        text_preview = (text_body[:120] + "…") if len(text_body) > 120 else text_body
+
+    sent = failed = blocked = 0
+    start_msg = await m.reply_text(
+        f"📣 Broadcast iniziato\nUtenti: {total}\nAnteprima: {text_preview}"
+    )
+
+    for i, u in enumerate(users, start=1):
+        if context.application.bot_data.get("broadcast_stop"):
+            break
+        chat_id = u["user_id"]
+        try:
+            if mode == "copy":
+                await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text_body,
+                    protect_content=True,
+                    disable_web_page_preview=True,
+                )
+            sent += 1
+        except Forbidden:
+            blocked += 1
+        except RetryAfter as e:
+            await aio.sleep(e.retry_after + 1)
+            try:
+                if mode == "copy":
+                    await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=text_body,
+                        protect_content=True,
+                        disable_web_page_preview=True,
+                    )
+                sent += 1
+            except Forbidden:
+                blocked += 1
+            except Exception:
+                failed += 1
+        except (BadRequest, NetworkError, Exception):
+            failed += 1
+
+        if i % BCAST_PROGRESS_EVERY == 0:
+            try:
+                await start_msg.edit_text(
+                    f"📣 In corso… {sent}/{total} | Bloccati {blocked} | Errori {failed}"
+                )
+            except Exception:
+                pass
+
+        await aio.sleep(BCAST_SLEEP)
+
+    stopped = context.application.bot_data.get("broadcast_stop", False)
+    status = "⏹️ Interrotto" if stopped else "✅ Completato"
+    await start_msg.edit_text(
+        f"{status}\nTotali: {total}\nInviati: {sent}\nBloccati: {blocked}\nErrori: {failed}"
+    )
+
+async def broadcast_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    context.application.bot_data["broadcast_stop"] = True
+    await update.message.reply_text("⏹️ Broadcast: verrà interrotto al prossimo step.")
+
 # ---------------- MAIN ----------------
 def main():
     if not BOT_TOKEN:
@@ -379,11 +479,13 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button))
 
     # Admin
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("utenti", utenti_cmd))
-    app.add_handler(CommandHandler("id",     id_cmd))
-    app.add_handler(CommandHandler("backup", backup_cmd))
-    app.add_handler(CommandHandler("restore_db", restore_db))
+    app.add_handler(CommandHandler("status",       status_cmd))
+    app.add_handler(CommandHandler("utenti",       utenti_cmd))
+    app.add_handler(CommandHandler("id",           id_cmd))
+    app.add_handler(CommandHandler("backup",       backup_cmd))
+    app.add_handler(CommandHandler("restore_db",   restore_db))
+    app.add_handler(CommandHandler("broadcast",    broadcast_cmd))
+    app.add_handler(CommandHandler("broadcast_stop", broadcast_stop_cmd))
 
     log.info("✅ BOT AVVIATO — %s", VERSION)
     app.run_polling()
