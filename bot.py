@@ -1,8 +1,9 @@
 # =====================================================
-# BPFAM TARANTO BOT – 2 bottoni + Admin style v3.6.5
+# BPFAM POTENZA BOT – 2 bottoni + Admin style v3.6.5
 # - 2 bottoni: MENÙ / CONTATTI-INFO + "⬅️ Torna indietro"
 # - Testi da ENV: WELCOME_TEXT, MENU_PAGE_TEXT, INFO_PAGE_TEXT
 # - Admin/DB/Backup/Restore/Broadcast come BPFARM v3.6.5-secure-full
+# - FIX DB: aggiunge automaticamente first_seen / last_seen se mancano
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio, aiohttp, zipfile
@@ -16,14 +17,14 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "2btn-taranto-based-on-3.6.5"
+VERSION = "2btn-potenza-based-on-3.6.5"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("bpfam-taranto-bot")
+log = logging.getLogger("bpfam-potenza-bot")
 
 # ---------------- ENV / TEXT ----------------
 def _txt(key, default=""):
@@ -60,24 +61,24 @@ PHOTO_URL = os.environ.get(
 
 WELCOME_TEXT = _txt(
     "WELCOME_TEXT",
-    "🥇Benvenuti nel bot ufficiale di BPFAM-TARANTO🥇\nScegli un’opzione qui sotto."
+    "🥇 BENVENUTO NEL BOT UFFICIALE DI POTENZA 🥇\nScegli un’opzione qui sotto."
 )
 MENU_PAGE_TEXT = _txt(
     "MENU_PAGE_TEXT",
-    "📖 *MENÙ — BPFAM TARANTO*\n"
+    "📖 *MENÙ — BPFAM POTENZA*\n"
     "Benvenuto nel menù interno del bot.\n\n"
     "• Voce A\n• Voce B\n• Voce C\n"
 )
 INFO_PAGE_TEXT = _txt(
     "INFO_PAGE_TEXT",
-    "📲 *CONTATTI & INFO — BPFAM TARANTO*\n"
+    "📲 *CONTATTI & INFO — BPFAM POTENZA*\n"
     "Canali verificati e contatti ufficiali.\n\n"
     "Instagram: @bpfamofficial\n"
     "Canale Telegram: t.me/...\n"
     "Contatto diretto: @contattobpfam\n"
 )
 
-# ---------------- DB (uguale stile BPFARM) ----------------
+# ---------------- DB (schema con first_seen / last_seen) ----------------
 def init_db():
     Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
@@ -87,35 +88,71 @@ def init_db():
         username TEXT,
         first_name TEXT,
         last_name TEXT,
-        joined TEXT
+        first_seen TEXT,
+        last_seen TEXT
     )"""
     )
-    try:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info('users')").fetchall()}
-        if "joined" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN joined TEXT;")
-            conn.commit()
-    except Exception:
-        pass
     conn.commit()
     conn.close()
 
-def add_user(u):
+def ensure_db_schema():
+    """
+    Garantisce che la tabella users abbia sempre le colonne first_seen e last_seen.
+    Serve per i DB vecchi che non le avevano (FIX 'no such column: first_seen').
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    try:
+        cur.execute("PRAGMA table_info('users')")
+        cols = {row[1] for row in cur.fetchall()}  # row[1] = nome colonna
+
+        if "first_seen" not in cols:
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN first_seen TEXT")
+                log.info("Colonna first_seen aggiunta alla tabella users.")
+            except sqlite3.OperationalError as e:
+                log.warning(f"Impossibile aggiungere first_seen: {e}")
+
+        if "last_seen" not in cols:
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
+                log.info("Colonna last_seen aggiunta alla tabella users.")
+            except sqlite3.OperationalError as e:
+                log.warning(f"Impossibile aggiungere last_seen: {e}")
+
+        conn.commit()
+    except Exception as e:
+        log.warning(f"Errore ensure_db_schema: {e}")
+    finally:
+        conn.close()
+
+def upsert_user(u):
     if not u:
         return
     conn = sqlite3.connect(DB_FILE)
-    conn.execute(
-        """INSERT OR IGNORE INTO users 
-        (user_id, username, first_name, last_name, joined)
-        VALUES (?, ?, ?, ?, ?)""",
-        (
-            u.id,
-            u.username,
-            u.first_name,
-            u.last_name,
-            datetime.now(timezone.utc).isoformat(),
-        ),
-    )
+    cur = conn.cursor()
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute("SELECT 1 FROM users WHERE user_id=?", (u.id,))
+    if cur.fetchone():
+        cur.execute(
+            """
+            UPDATE users SET
+                username=?,
+                first_name=?,
+                last_name=?,
+                last_seen=?
+            WHERE user_id=?
+            """,
+            (u.username, u.first_name, u.last_name, now, u.id),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO users(user_id, username, first_name, last_name, first_seen, last_seen)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (u.id, u.username, u.first_name, u.last_name, now, now),
+        )
     conn.commit()
     conn.close()
 
@@ -130,7 +167,7 @@ def get_all_users():
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute(
-        "SELECT user_id, username, first_name, last_name, joined FROM users ORDER BY joined ASC"
+        "SELECT user_id, username, first_name, last_name, first_seen, last_seen FROM users ORDER BY first_seen ASC"
     )
     out = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -240,7 +277,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     if user:
-        add_user(user)
+        upsert_user(user)
     if not chat:
         return
     await show_home_from_start(chat, context)
@@ -453,7 +490,7 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-# --- /restore_db (MERGE, come v3.6.5)
+# --- /restore_db (MERGE, supporta anche DB senza first_seen/last_seen)
 async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         return
@@ -493,7 +530,8 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
             username TEXT,
             first_name TEXT,
             last_name  TEXT,
-            joined     TEXT
+            first_seen TEXT,
+            last_seen  TEXT
         )"""
         )
         main.commit()
@@ -501,34 +539,33 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cols_imp = {
             r[1] for r in imp.execute("PRAGMA table_info('users')").fetchall()
         }
-        if "joined" in cols_imp:
+
+        if "first_seen" in cols_imp and "last_seen" in cols_imp:
             rows = imp.execute(
-                "SELECT user_id,username,first_name,last_name,joined FROM users"
+                "SELECT user_id,username,first_name,last_name,first_seen,last_seen FROM users"
             ).fetchall()
         else:
+            # DB vecchi senza colonne → metto now come first/last_seen
+            now_iso = datetime.now(timezone.utc).isoformat()
             rows = [
-                (uid, un, fn, ln, None)
+                (uid, un, fn, ln, now_iso, now_iso)
                 for (uid, un, fn, ln) in imp.execute(
                     "SELECT user_id,username,first_name,last_name FROM users"
                 ).fetchall()
             ]
 
         before = main.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        now_iso = datetime.now(timezone.utc).isoformat()
 
         sql = """
-        INSERT INTO users (user_id, username, first_name, last_name, joined)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO users (user_id, username, first_name, last_name, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             username   = COALESCE(excluded.username, users.username),
             first_name = COALESCE(excluded.first_name, users.first_name),
-            last_name  = COALESCE(excluded.last_name,  users.last_name)
+            last_name  = COALESCE(excluded.last_name,  users.last_name),
+            last_seen  = COALESCE(excluded.last_seen,  users.last_seen)
         """
-        payload = [
-            (uid, un, fn, ln, jn or now_iso)
-            for (uid, un, fn, ln, jn) in rows
-        ]
-        main.executemany(sql, payload)
+        main.executemany(sql, rows)
         main.commit()
 
         after = main.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -567,15 +604,16 @@ async def utenti_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["user_id", "username", "first_name", "last_name", "joined"])
+        w.writerow(["user_id", "username", "first_name", "last_name", "first_seen", "last_seen"])
         for u in users:
             w.writerow(
                 [
-                    u["user_id"],
-                    u["username"] or "",
-                    u["first_name"] or "",
-                    u["last_name"] or "",
-                    u["joined"] or "",
+                    u.get("user_id", ""),
+                    u.get("username") or "",
+                    u.get("first_name") or "",
+                    u.get("last_name") or "",
+                    u.get("first_seen") or "",
+                    u.get("last_seen") or "",
                 ]
             )
     await update.message.reply_text(
@@ -625,12 +663,12 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if m.reply_to_message:
         mode = "copy"
+        text_body = None
         text_preview = (
             m.reply_to_message.text
             or m.reply_to_message.caption
             or "(media)"
         )
-        text_body = None
     else:
         mode = "text"
         text_body = " ".join(context.args) if context.args else None
@@ -745,6 +783,8 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN mancante")
     init_db()
+    ensure_db_schema()   # <<< FIX colonne mancanti sui DB vecchi
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # anti-conflict: rimuove webhook prima del polling
@@ -783,7 +823,7 @@ def main():
     app.job_queue.run_repeating(reset_flood, 10)                       # reset anti-flood
     app.job_queue.run_repeating(keep_alive_job, 600, first=60)         # keep-alive 10 min
 
-    log.info(f"🚀 BPFAM TARANTO BOT avviato — v{VERSION}")
+    log.info(f"🚀 BPFAM POTENZA BOT avviato — v{VERSION}")
     app.run_polling(
         drop_pending_updates=True, allowed_updates=Update.ALL_TYPES
     )
