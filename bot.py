@@ -3,6 +3,7 @@
 # - Menu + Info con bottone Indietro
 # - /status, /utenti (CSV), /backup, /restore_db (MERGE), /broadcast
 # - protect_content=True su tutti i contenuti
+# - SOLO /backup è SBLOCCATO per il download
 # - Messaggio fissato AUTOMATICO: "👥 Iscritti Apulian Dealer {totale}"
 # =====================================================
 
@@ -151,13 +152,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if u:
         upsert_user(u)
 
-    # 1) foto protetta
     try:
         await chat.send_photo(PHOTO_URL, protect_content=True)
     except Exception as e:
         log.warning(f"Errore invio foto: {e}")
 
-    # 2) messaggio con bottoni
     try:
         await chat.send_message(
             WELCOME_TEXT,
@@ -167,7 +166,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning(f"Errore invio welcome: {e}")
 
-    # 3) messaggio fissato con numero iscritti AUTOMATICO
     try:
         total = count_users()
         stats_msg = await chat.send_message(
@@ -240,34 +238,26 @@ async def utenti_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             protect_content=True
         )
 
+# ✅ BACKUP SBLOCCATO (scaricabile)
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
 
     ok, why = is_sqlite_db(DB_FILE)
     if not ok:
-        await update.message.reply_text(f"⚠️ DB non valido: {why}", protect_content=True)
+        await update.message.reply_text(f"⚠️ DB non valido: {why}")
         return
 
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     db_out  = Path(BACKUP_DIR) / f"backup_{stamp}.db"
-    zip_out = Path(BACKUP_DIR) / f"backup_{stamp}.zip"
 
     shutil.copy2(DB_FILE, db_out)
-
-    with zipfile.ZipFile(zip_out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.write(db_out, arcname=db_out.name)
 
     with open(db_out, "rb") as fh:
         await update.message.reply_document(
             document=InputFile(fh, filename=db_out.name),
-            protect_content=True
-        )
-    with open(zip_out, "rb") as fh:
-        await update.message.reply_document(
-            document=InputFile(fh, filename=zip_out.name),
-            protect_content=True
+            caption="✅ Backup pronto da scaricare"
         )
 
 async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -404,11 +394,9 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Pubblici
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    # Admin
     app.add_handler(CommandHandler("status",    status_cmd))
     app.add_handler(CommandHandler("utenti",    utenti_cmd))
     app.add_handler(CommandHandler("backup",    backup_cmd))
