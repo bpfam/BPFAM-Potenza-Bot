@@ -135,10 +135,18 @@ def is_sqlite_db(path: str):
 
 # ---------------- KEYBOARD ----------------
 def kb_home():
-    return InlineKeyboardMarkup([[ 
-        InlineKeyboardButton("📖 MENÙ", callback_data="MENU"),
-        InlineKeyboardButton("📲 CONTATTI", callback_data="INFO")
-    ]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📖 MENÙ", callback_data="MENU"),
+            InlineKeyboardButton("📲 CONTATTI", callback_data="INFO")
+        ],
+        [
+            InlineKeyboardButton(
+                "🎥 VETRINA",
+                url="https://bpfam.github.io/Apulian-Dealer/index.html"
+            )
+        ]
+    ])
 
 def kb_back():
     return InlineKeyboardMarkup([[ 
