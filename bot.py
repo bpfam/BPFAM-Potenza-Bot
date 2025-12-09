@@ -1,6 +1,9 @@
 # =====================================================
-# BPFAM POTENZA BOT — FULL: ADMIN + DB + BACKUP + RESTORE + BROADCAST
-# Clonabile per altri bot (basta cambiare le ENV)
+# BPFAM POTENZA BOT — FULL v1.3 PROTECT
+# - Menu + Info con bottone Indietro
+# - /status, /utenti (CSV), /backup, /restore_db (MERGE), /broadcast
+# - Admin safe (se ADMIN_IDS vuoto => tutti admin)
+# - protect_content=True su contenuti bot (no inoltro)
 # =====================================================
 
 import os, csv, shutil, logging, sqlite3, asyncio as aio, aiohttp, zipfile
@@ -10,11 +13,11 @@ from collections import defaultdict
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, JobQueue, filters
+    MessageHandler, ContextTypes, filters
 )
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "POTENZA-FULL-1.0"
+VERSION = "POTENZA-FULL-1.3-PROTECT"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
@@ -41,11 +44,11 @@ WELCOME_TEXT = os.environ.get(
 )
 MENU_PAGE_TEXT = os.environ.get(
     "MENU_PAGE_TEXT",
-    "📖 *MENÙ — BPFAM POTENZA*\n• Voce A\n• Voce B\n• Voce C"
+    "📖 MENÙ — BPFAM POTENZA\n• Voce A\n• Voce B\n• Voce C"
 )
 INFO_PAGE_TEXT = os.environ.get(
     "INFO_PAGE_TEXT",
-    "📲 *CONTATTI & INFO — BPFAM POTENZA*"
+    "📲 CONTATTI & INFO — BPFAM POTENZA"
 )
 
 # ---------------- ADMIN (SAFE MODE) ----------------
@@ -130,13 +133,6 @@ def get_all_users():
     conn.close()
     return rows
 
-def parse_hhmm(h):
-    try:
-        h, m = map(int, h.split(":"))
-        return dtime(h, m)
-    except:
-        return dtime(3, 0)
-
 def is_sqlite_db(path: str):
     p = Path(path)
     if not p.exists():
@@ -168,29 +164,41 @@ def kb_back():
 # ---------------- HANDLER PUBBLICI ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    chat = update.effective_chat
     if u:
         upsert_user(u)
+
+    # 1) foto protetta (non inoltrabile)
     try:
-        await update.message.reply_photo(
+        await chat.send_photo(
             PHOTO_URL,
-            caption=WELCOME_TEXT,
-            reply_markup=kb_home()
+            protect_content=True
         )
-    except Exception:
-        await update.message.reply_text(
+    except Exception as e:
+        log.warning(f"Errore invio foto start: {e}")
+
+    # 2) messaggio di testo con bottoni, protetto
+    try:
+        await chat.send_message(
             WELCOME_TEXT,
-            reply_markup=kb_home()
+            reply_markup=kb_home(),
+            protect_content=True
         )
+    except Exception as e:
+        log.warning(f"Errore invio testo start: {e}")
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
     await q.answer()
+
+    # il messaggio dei bottoni è già stato creato con protect_content=True,
+    # quindi resta protetto anche quando viene editato.
     if q.data == "MENU":
-        await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back(), parse_mode="Markdown")
+        await q.message.edit_text(MENU_PAGE_TEXT, reply_markup=kb_back())
     elif q.data == "INFO":
-        await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back(), parse_mode="Markdown")
+        await q.message.edit_text(INFO_PAGE_TEXT, reply_markup=kb_back())
     elif q.data == "HOME":
         await q.message.edit_text(WELCOME_TEXT, reply_markup=kb_home())
 
@@ -199,19 +207,55 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
-        f"✅ Online v{VERSION}\n👥 Utenti: {count_users()}\nDB: {DB_FILE}\nBackup dir: {BACKUP_DIR}"
+        f"✅ Online v{VERSION}\n👥 Utenti: {count_users()}\nDB: {DB_FILE}\nBackup dir: {BACKUP_DIR}",
+        protect_content=True
     )
 
 async def utenti_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+
     users = get_all_users()
-    await update.message.reply_text(f"👥 Utenti totali: {len(users)}")
+    n = len(users)
+
+    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    csv_path = Path(BACKUP_DIR) / f"users_{stamp}.csv"
+
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["user_id", "username", "first_name", "last_name", "first_seen", "last_seen"])
+            for u in users:
+                w.writerow([
+                    u.get("user_id", ""),
+                    u.get("username") or "",
+                    u.get("first_name") or "",
+                    u.get("last_name") or "",
+                    u.get("first_seen") or "",
+                    u.get("last_seen") or "",
+                ])
+    except Exception as e:
+        await update.message.reply_text(f"❌ Errore creazione CSV utenti: {e}", protect_content=True)
+        return
+
+    await update.message.reply_text(f"👥 Utenti totali: {n}", protect_content=True)
+
+    try:
+        with open(csv_path, "rb") as fh:
+            await update.message.reply_document(
+                document=InputFile(fh, filename=csv_path.name),
+                caption=f"📂 Lista utenti esportata ({n} righe)",
+                protect_content=True
+            )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ CSV creato ma non inviato: {e}", protect_content=True)
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Il tuo ID è: <code>{update.effective_user.id}</code>",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        protect_content=True
     )
 
 # ---------------- BACKUP ----------------
@@ -221,7 +265,7 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok, why = is_sqlite_db(DB_FILE)
     if not ok:
-        await update.message.reply_text(f"⚠️ DB non valido: {why}")
+        await update.message.reply_text(f"⚠️ DB non valido: {why}", protect_content=True)
         return
 
     try:
@@ -235,28 +279,28 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with zipfile.ZipFile(zip_out, "w", compression=zipfile.ZIP_DEFLATED) as z:
             z.write(db_out, arcname=db_out.name)
 
-        # invio .db
         try:
             with open(db_out, "rb") as fh:
                 await update.message.reply_document(
                     document=InputFile(fh, filename=db_out.name),
                     caption=f"✅ Backup .db: {db_out.name}",
+                    protect_content=True
                 )
         except Exception as e:
-            await update.message.reply_text(f"⚠️ Impossibile inviare il .db: {e}")
+            await update.message.reply_text(f"⚠️ Impossibile inviare il .db: {e}", protect_content=True)
 
-        # invio .zip
         try:
             with open(zip_out, "rb") as fh:
                 await update.message.reply_document(
                     document=InputFile(fh, filename=zip_out.name),
                     caption=f"✅ Backup ZIP: {zip_out.name}",
+                    protect_content=True
                 )
         except Exception as e:
-            await update.message.reply_text(f"⚠️ Impossibile inviare lo ZIP: {e}")
+            await update.message.reply_text(f"⚠️ Impossibile inviare lo ZIP: {e}", protect_content=True)
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Errore backup: {e}")
+        await update.message.reply_text(f"❌ Errore backup: {e}", protect_content=True)
 
 # ---------------- RESTORE_DB (MERGE) ----------------
 async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,7 +314,8 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "1️⃣ Invia un file .db al bot\n"
             "2️⃣ Tieni premuto sul file ➜ *Rispondi*\n"
             "3️⃣ Scrivi /restore_db come risposta a QUEL file",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            protect_content=True
         )
         return
 
@@ -282,12 +327,12 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(custom_path=str(tmp))
     except Exception as e:
-        await update.message.reply_text(f"❌ Errore download file: {e}")
+        await update.message.reply_text(f"❌ Errore download file: {e}", protect_content=True)
         return
 
     ok, why = is_sqlite_db(str(tmp))
     if not ok:
-        await update.message.reply_text(f"❌ Il file non è un DB SQLite valido: {why}")
+        await update.message.reply_text(f"❌ Il file non è un DB SQLite valido: {why}", protect_content=True)
         try:
             tmp.unlink(missing_ok=True)
         except Exception:
@@ -345,11 +390,12 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Restore completato.\n"
             f"Utenti prima: {before}\n"
             f"Utenti dopo:  {after}\n"
-            f"Aggiunti/aggiornati: {after-before}"
+            f"Aggiunti/aggiornati: {after-before}",
+            protect_content=True
         )
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Errore restore: {e}")
+        await update.message.reply_text(f"❌ Errore restore: {e}", protect_content=True)
     finally:
         try:
             imp.close()
@@ -376,12 +422,11 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = get_all_users()
     total = len(users)
     if total == 0:
-        await m.reply_text("Nessun utente nel DB.")
+        await m.reply_text("Nessun utente nel DB.", protect_content=True)
         return
 
     context.application.bot_data["broadcast_stop"] = False
 
-    # Modalità: reply (copia media) oppure testo
     if m.reply_to_message:
         mode = "copy"
         text_preview = (
@@ -395,14 +440,16 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_body = " ".join(context.args) if context.args else None
         if not text_body:
             await m.reply_text(
-                "Uso: /broadcast <testo> oppure in reply a un contenuto /broadcast"
+                "Uso: /broadcast <testo> oppure in reply a un contenuto /broadcast",
+                protect_content=True
             )
             return
         text_preview = (text_body[:120] + "…") if len(text_body) > 120 else text_body
 
     sent = failed = blocked = 0
     start_msg = await m.reply_text(
-        f"📣 Broadcast iniziato\nUtenti: {total}\nAnteprima: {text_preview}"
+        f"📣 Broadcast iniziato\nUtenti: {total}\nAnteprima: {text_preview}",
+        protect_content=True
     )
 
     for i, u in enumerate(users, start=1):
@@ -411,7 +458,10 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = u["user_id"]
         try:
             if mode == "copy":
-                await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
+                await m.reply_to_message.copy(
+                    chat_id=chat_id,
+                    protect_content=True
+                )
             else:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -426,7 +476,10 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await aio.sleep(e.retry_after + 1)
             try:
                 if mode == "copy":
-                    await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
+                    await m.reply_to_message.copy(
+                        chat_id=chat_id,
+                        protect_content=True
+                    )
                 else:
                     await context.bot.send_message(
                         chat_id=chat_id,
@@ -462,7 +515,7 @@ async def broadcast_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(update.effective_user.id):
         return
     context.application.bot_data["broadcast_stop"] = True
-    await update.message.reply_text("⏹️ Broadcast: verrà interrotto al prossimo step.")
+    await update.message.reply_text("⏹️ Broadcast: verrà interrotto al prossimo step.", protect_content=True)
 
 # ---------------- MAIN ----------------
 def main():
