@@ -1,7 +1,10 @@
 # =====================================================
-# APULIAN DEALER BOT — FULL v1.6 PROTECT + PIN AUTO
+# APULIAN DEALER BOT — FULL v1.7 PROTECT + PIN AUTO + BDEL
 # - Menu + Info con bottone Indietro
-# - /status, /utenti (CSV), /backup, /restore_db (MERGE), /broadcast
+# - /status, /utenti (CSV), /backup, /restore_db (MERGE)
+# - /broadcast: invia a tutti (testo o copia media in reply)
+# - /broadcast_delete: prova a cancellare l'ULTIMO broadcast
+#   da tutte le chat (finché il bot non viene riavviato)
 # - protect_content=True su tutti i contenuti
 # - SOLO /backup è SBLOCCATO per il download
 # - Messaggio fissato AUTOMATICO: "👥 Iscritti Apulian Dealer {totale}"
@@ -17,7 +20,7 @@ from telegram.ext import (
 )
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 
-VERSION = "APULIAN-FULL-1.6-PROTECT-AUTO"
+VERSION = "APULIAN-FULL-1.7-PROTECT-AUTO-BDEL"
 
 # ---------------- LOG ----------------
 logging.basicConfig(
@@ -318,7 +321,11 @@ async def restore_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     main.close()
     tmp.unlink(missing_ok=True)
 
-# ---------------- BROADCAST ----------------
+# ---------------- BROADCAST + DELETE ----------------
+
+# chat_id -> message_id dell’ULTIMO broadcast inviato finché il bot è acceso
+LAST_BROADCAST: dict[int, int] = {}
+
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -355,17 +362,23 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         protect_content=True
     )
 
+    LAST_BROADCAST.clear()
+
     for u in users:
         chat_id = u["user_id"]
         try:
             if mode == "copy" and m.reply_to_message:
-                await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
+                msg_out = await m.reply_to_message.copy(
+                    chat_id=chat_id,
+                    protect_content=True
+                )
             else:
-                await context.bot.send_message(
+                msg_out = await context.bot.send_message(
                     chat_id=chat_id,
                     text=text_body,
                     protect_content=True
                 )
+            LAST_BROADCAST[chat_id] = msg_out.message_id
             sent += 1
         except Forbidden:
             blocked += 1
@@ -373,13 +386,17 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await aio.sleep(e.retry_after + 1)
             try:
                 if mode == "copy" and m.reply_to_message:
-                    await m.reply_to_message.copy(chat_id=chat_id, protect_content=True)
+                    msg_out = await m.reply_to_message.copy(
+                        chat_id=chat_id,
+                        protect_content=True
+                    )
                 else:
-                    await context.bot.send_message(
+                    msg_out = await context.bot.send_message(
                         chat_id=chat_id,
                         text=text_body,
                         protect_content=True
                     )
+                LAST_BROADCAST[chat_id] = msg_out.message_id
                 sent += 1
             except Exception:
                 failed += 1
@@ -390,6 +407,42 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await info_msg.edit_text(
         f"✅ Broadcast finito\nTotali: {total}\nInviati: {sent}\nBloccati: {blocked}\nErrori: {failed}",
+        protect_content=True
+    )
+
+async def broadcast_delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not LAST_BROADCAST:
+        await update.message.reply_text(
+            "❌ Nessun broadcast recente da cancellare (o bot riavviato).",
+            protect_content=True
+        )
+        return
+
+    ok = err = 0
+    for chat_id, msg_id in list(LAST_BROADCAST.items()):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            ok += 1
+        except (Forbidden, BadRequest):
+            err += 1
+        except RetryAfter as e:
+            await aio.sleep(e.retry_after + 1)
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                ok += 1
+            except Exception:
+                err += 1
+        except Exception:
+            err += 1
+        await aio.sleep(0.05)
+
+    LAST_BROADCAST.clear()
+
+    await update.message.reply_text(
+        f"🧹 Broadcast cancellato.\n✅ Eliminati: {ok}\n⚠️ Errori: {err}",
         protect_content=True
     )
 
@@ -405,11 +458,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    app.add_handler(CommandHandler("status",    status_cmd))
-    app.add_handler(CommandHandler("utenti",    utenti_cmd))
-    app.add_handler(CommandHandler("backup",    backup_cmd))
-    app.add_handler(CommandHandler("restore_db", restore_db))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("status",          status_cmd))
+    app.add_handler(CommandHandler("utenti",          utenti_cmd))
+    app.add_handler(CommandHandler("backup",          backup_cmd))
+    app.add_handler(CommandHandler("restore_db",      restore_db))
+    app.add_handler(CommandHandler("broadcast",       broadcast_cmd))
+    app.add_handler(CommandHandler("broadcast_delete", broadcast_delete_cmd))
 
     log.info("✅ BOT AVVIATO — %s", VERSION)
     app.run_polling()
